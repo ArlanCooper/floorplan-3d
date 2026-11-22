@@ -402,8 +402,8 @@ main.drawer-panel #fab{opacity:0;visibility:hidden}
       <button class="btn" id="peNew">新建空白</button>
       <button class="btn" id="peImport">导入户型</button>
       <button class="btn" id="peExport">导出户型</button>
-      <button class="btn" id="peCancel">取消</button>
-      <button class="btn primary" id="peApply">应用户型</button>
+      <button class="btn" id="peCancel" title="返回 2D（不保存本次修改）">← 返回</button>
+      <button class="btn primary" id="peApply" title="保存并应用到 2D / 3D">保存</button>
     </div>
   </div>
   <div class="pe-body">
@@ -442,9 +442,11 @@ main.drawer-panel #fab{opacity:0;visibility:hidden}
       <section class="pe-help">
         <h3>操作提示</h3>
         <p>墙体：按住拖动画一条墙，自动取水平 / 垂直，端点会吸附到已有墙角。</p>
+        <p>数字调整：选中墙体后，右侧可直接输入 X / Y / 长度 / 厚度。</p>
         <p>房间：拖出矩形；勾选「自动生成墙」会沿房间外侧加一圈墙。</p>
         <p>门窗：先点「门 / 窗 / 推拉门」，再点已有墙体，会自动在墙上开洞并补门扇 / 窗。</p>
         <p>删除：点「删除」后点对象；删门窗会自动补回墙洞。</p>
+        <p>「← 返回」放弃修改回 2D；「保存」应用并保存。</p>
         <p>滚轮缩放，空白处拖动平移；`F` 适应。</p>
       </section>
     </aside>
@@ -500,6 +502,7 @@ function applyStaticLang(){
  *  按用户提供的两室两厅两卫户型图重建：
  *  厨房 2500×2550、次卧2 2900×2550、公卫 2800×1550、主卫 1950×2000、
  *  玄关 2400×1250、次卧1 2650×2750、客餐厅 3300×6200、主卧 3100×4000、阳台 3300×1350
+ *  坐标按可读方向编写，启动时 mirrorBuiltInPlan() 会水平翻转到图片当前方向
  * ============================================================ */
 // 墙体：[x0,y0,x1,y1,类型]  b=承重(黑) e=外墙 n=可拆非承重 low=矮墙
 const WALLS = [
@@ -657,10 +660,11 @@ function defaultFurniture(){ if (customPlan) return []; return [
 
 function defaultState(){
   const rooms = {}; ROOMS.forEach(r => rooms[r.id] = {name:r.name, mat:r.mat});
-  return {furniture:defaultFurniture(), rooms, demolished:[], measures:[]};
+  const furniture = defaultFurniture().map(f => ({...f, cx:3450-f.cx, rot:(360-f.rot)%360}));
+  return {furniture, rooms, demolished:[], measures:[]};
 }
 
-const STORE = 'huxing-design-v2';
+const STORE = 'huxing-design-v3';
 function load(){
   try { const s = JSON.parse(localStorage.getItem(STORE)); if (s && Array.isArray(s.furniture)) return fixState(s); } catch(e) {}
   return null;
@@ -681,8 +685,20 @@ const PLAN_CENTER = {x:1725, y:5350};       // 3D 场景中心；户型编辑器
 const $ = s => document.querySelector(s);
 const svg = $('#plan');
 
+/* 用户提供的户型图是镜像方向：内置数据按可读方向编写，启动时整体水平翻转，
+   让页面里的房间位置与图片当前方向一致（文字仍保持可读）。 */
+function mirrorBuiltInPlan(){
+  const S = 3450, mx = x => S - x;            // 当前户型 x 范围的左右对称轴
+  const flipX = r => { const a = mx(r[0]), b = mx(r[2]); r[0] = Math.min(a,b); r[2] = Math.max(a,b); };
+  WALLS.forEach(flipX); WINS.forEach(flipX); BAYS.forEach(flipX);
+  SLIDES.forEach(s => flipX(s.rect));
+  DOORS.forEach(d => { flipX(d.rect); d.h[0] = mx(d.h[0]); d.c[0] = -d.c[0]; d.o[0] = -d.o[0]; });
+  ROOMS.forEach(r => { r.poly = r.poly.map(([x,y]) => [mx(x), y]).reverse(); r.at[0] = mx(r.at[0]); });
+}
+mirrorBuiltInPlan();
+
 /* 自定义户型持久化：换页面 / 刷新后仍保留自己画的墙、房间、门窗 */
-const PLAN_STORE = 'huxing-plan-v2';
+const PLAN_STORE = 'huxing-plan-v3';
 function savePlan(){ try { localStorage.setItem(PLAN_STORE, JSON.stringify({WALLS, WINS, DOORS, SLIDES, BAYS, ROOMS})); } catch(e) {} }
 function loadPlan(){
   try {
@@ -1675,7 +1691,7 @@ const planEditor = (() => {
   const empty = () => ({WALLS:[], WINS:[], DOORS:[], SLIDES:[], BAYS:[], ROOMS:[]});
   const svg = q('#peSvg'), el = q('#planEditor');
   let open = false, tool = 'select', draft = empty(), sel = null, viewBox = {x:0, y:0, w:10000, h:8000};
-  let drag = null, pan = null, hover = null, history = [], future = [];
+  let drag = null, pan = null, hover = null, history = [], future = [], baseline = null;
 
   const num = (id, def) => { const v = parseFloat(q(id).value); return Number.isFinite(v) ? v : def; };
   const round = v => Math.round(v/10)*10;
@@ -1962,10 +1978,27 @@ const planEditor = (() => {
     const {kind, i} = sel;
     if (kind === 'wall'){
       const w = draft.WALLS[i]; if (!w){ sel = null; return renderProps(); }
-      const len = Math.round(Math.max(w[2]-w[0], w[3]-w[1])), th = Math.round(Math.min(w[2]-w[0], w[3]-w[1]));
-      box.innerHTML = `<div class="pe-row"><span>长度</span><b>${len} mm</b></div><div class="pe-row"><span>厚度</span><b>${th} mm</b></div>
-        <label style="margin-top:8px">类型 <select id="peSelType"><option value="e"${w[4]==='e'?' selected':''}>外墙</option><option value="n"${w[4]==='n'?' selected':''}>非承重内墙</option><option value="b"${w[4]==='b'?' selected':''}>承重墙</option><option value="low"${w[4]==='low'?' selected':''}>矮墙</option></select></label>
+      const horiz = (w[2]-w[0]) >= (w[3]-w[1]);
+      const len = Math.round(horiz ? w[2]-w[0] : w[3]-w[1]);
+      const th = Math.round(horiz ? w[3]-w[1] : w[2]-w[0]);
+      box.innerHTML = `<label>X 起点 <input type="number" id="peSelX" value="${Math.round(w[0])}" step="10"></label>
+        <label>Y 起点 <input type="number" id="peSelY" value="${Math.round(w[1])}" step="10"></label>
+        <label>长度 mm <input type="number" id="peSelLen" value="${len}" min="100" step="10"></label>
+        <label>厚度 mm <input type="number" id="peSelTh" value="${th}" min="40" step="10"></label>
+        <label>类型 <select id="peSelType"><option value="e"${w[4]==='e'?' selected':''}>外墙</option><option value="n"${w[4]==='n'?' selected':''}>非承重内墙</option><option value="b"${w[4]==='b'?' selected':''}>承重墙</option><option value="low"${w[4]==='low'?' selected':''}>矮墙</option></select></label>
+        <div class="muted" style="font-size:11px;margin:4px 0 6px">数字修改墙的长宽 / 位置；已有门窗不会自动跟着移动。</div>
         <button class="btn" id="peSelDel">删除墙体</button>`;
+      const applyWallEdit = () => {
+        const x = round(num('#peSelX', w[0])), y = round(num('#peSelY', w[1]));
+        const T = Math.max(40, round(num('#peSelTh', th)));
+        const L = Math.max(100, T, round(num('#peSelLen', len)));
+        if (x === w[0] && y === w[1] && L === len && T === th) return;
+        pushHistory();
+        if (horiz){ w[0] = x; w[1] = y; w[2] = x + L; w[3] = y + T; }
+        else { w[0] = x; w[1] = y; w[2] = x + T; w[3] = y + L; }
+        render(); renderProps();
+      };
+      ['peSelX','peSelY','peSelLen','peSelTh'].forEach(id => q('#'+id).onchange = applyWallEdit);
       q('#peSelType').onchange = e => { pushHistory(); w[4] = e.target.value; render(); };
       q('#peSelDel').onclick = deleteSel;
     } else if (kind === 'room'){
@@ -2102,7 +2135,7 @@ const planEditor = (() => {
   function apply(){
     if (!draft.ROOMS.length) return toast(tr('至少画一个房间，3D 才有地面','Draw at least one room for the 3D floor'));
     const keep = q('#peKeepFurn').checked;
-    if (!confirm(`应用后将${keep?'保留':'清空'}现有家具，并重建 2D / 3D 户型。继续？`)) return;
+    if (!confirm(`保存后将${keep?'保留':'清空'}现有家具，并重建 2D / 3D 户型。继续？`)) return;
     draft.ROOMS = draft.ROOMS.filter(r => r.poly.length >= 3 && area(r.poly) > .001);
     if (!draft.ROOMS.length) return toast(tr('房间无效，请重新绘制','No valid room'));
     relabelRooms();
@@ -2118,8 +2151,8 @@ const planEditor = (() => {
     state = {furniture:keep ? state.furniture : [], rooms, demolished:[], measures:[]};
     customPlan = true;
     ui.sel = null; undoStack.length = 0; redoStack.length = 0;
-    savePlan(); save(); close(); fitView(); renderAll(); window.View3D?.setOrigin(PLAN_CENTER.x, PLAN_CENTER.y);
-    toast(tr('户型已应用，可以开始添加家具了','Plan applied — start adding furniture'));
+    savePlan(); save(); close(true); fitView(); renderAll(); window.View3D?.setOrigin(PLAN_CENTER.x, PLAN_CENTER.y);
+    toast(tr('户型已保存并应用，可以开始添加家具了','Plan saved and applied — start adding furniture'));
   }
 
   function keydown(e){
@@ -2146,15 +2179,18 @@ const planEditor = (() => {
     q('#peProps').textContent = '未选中。用「选择」点墙、房间或门窗。';
     el.hidden = false; el.setAttribute('aria-hidden', 'false'); document.body.classList.add('pe-open');
     setTool('select'); fit();
+    baseline = clone(draft);
     open = true;
   }
-  function close(){
+  function close(force = false){
+    if (!force && baseline && JSON.stringify(draft) !== JSON.stringify(baseline) &&
+        !confirm('返回会放弃本次未保存的户型修改，确定返回？')) return;
     open = false; el.hidden = true; el.setAttribute('aria-hidden', 'true');
     document.body.classList.remove('pe-open'); sel = null; svg.innerHTML = '';
   }
 
   q('#planEdit').onclick = openEditor;
-  q('#peCancel').onclick = close;
+  q('#peCancel').onclick = () => close();
   q('#peApply').onclick = apply;
   q('#peNew').onclick = newBlank;
   q('#peMakeRect').onclick = template;
