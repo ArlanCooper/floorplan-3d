@@ -443,6 +443,7 @@ main.drawer-panel #fab{opacity:0;visibility:hidden}
         <h3>操作提示</h3>
         <p>墙体：按住拖动画一条墙，自动取水平 / 垂直，端点会吸附到已有墙角。</p>
         <p>数字调整：选中墙体后，右侧可直接输入 X / Y / 长度 / 厚度。</p>
+        <p>移动对齐：选择工具下拖动墙体 / 门窗，会自动吸附其他墙边、墙角和 10mm 网格；拖动墙体时 Shift 可锁定单方向。</p>
         <p>房间：拖出矩形；勾选「自动生成墙」会沿房间外侧加一圈墙。</p>
         <p>门窗：先点「门 / 窗 / 推拉门」，再点已有墙体，会自动在墙上开洞并补门扇 / 窗。</p>
         <p>删除：点「删除」后点对象；删门窗会自动补回墙洞。</p>
@@ -1692,6 +1693,7 @@ const planEditor = (() => {
   const svg = q('#peSvg'), el = q('#planEditor');
   let open = false, tool = 'select', draft = empty(), sel = null, viewBox = {x:0, y:0, w:10000, h:8000};
   let drag = null, pan = null, hover = null, history = [], future = [], baseline = null;
+  let move = null;   // 选择工具拖动墙体 / 门窗时的移动状态
 
   const num = (id, def) => { const v = parseFloat(q(id).value); return Number.isFinite(v) ? v : def; };
   const round = v => Math.round(v/10)*10;
@@ -1806,6 +1808,97 @@ const planEditor = (() => {
     draft.WALLS.forEach((w, i) => { const d = wallDist(w, x, y); if (d < bd){ bd = d; best = {i, w}; } });
     return best && bd <= Math.max(160, num('#peWallT',120)/2 + 60) ? best : null;
   }
+
+  function sameBand(a, b, horiz){
+    return horiz
+      ? Math.abs(a[1]-b[1]) < 2 && Math.abs(a[3]-b[3]) < 2
+      : Math.abs(a[0]-b[0]) < 2 && Math.abs(a[2]-b[2]) < 2;
+  }
+  function bestDelta(vals, targets, max = 150){
+    let best = null;
+    vals.forEach(v => targets.forEach(t => {
+      const d = t - v;
+      if (Math.abs(d) < 1) return;
+      if (Math.abs(d) <= max && (!best || Math.abs(d) < Math.abs(best.d))) best = {d, at:t};
+    }));
+    return best;
+  }
+  function moveWall(orig, idx, rawDx, rawDy, lock){
+    const w = orig.WALLS[idx], horiz = (w[2]-w[0]) >= (w[3]-w[1]);
+    const group = [];
+    orig.WALLS.forEach((x, i) => { if (sameBand(x, w, horiz)) group.push(i); });
+    const exclude = new Set(group), xs = [], ys = [];
+    orig.WALLS.forEach((x, i) => {
+      if (exclude.has(i)) return;
+      xs.push(x[0], x[2], (x[0]+x[2])/2); ys.push(x[1], x[3], (x[1]+x[3])/2);
+    });
+    orig.ROOMS.forEach(r => r.poly.forEach(p => { xs.push(p[0]); ys.push(p[1]); }));
+    const sx = lock === 'y' ? null : bestDelta([w[0], w[2], (w[0]+w[2])/2], xs);
+    const sy = lock === 'x' ? null : bestDelta([w[1], w[3], (w[1]+w[3])/2], ys);
+    let dx = sx ? sx.d : Math.round((w[0]+rawDx)/10)*10 - w[0];
+    let dy = sy ? sy.d : Math.round((w[1]+rawDy)/10)*10 - w[1];
+    if (lock === 'x') dy = 0; if (lock === 'y') dx = 0;
+    const d = clone(orig);
+    const spans = group.map(i => horiz ? [orig.WALLS[i][0], orig.WALLS[i][2]] : [orig.WALLS[i][1], orig.WALLS[i][3]]).flat();
+    const min = Math.min(...spans), max = Math.max(...spans);
+    group.forEach(i => { const x = d.WALLS[i]; x[0] += dx; x[2] += dx; x[1] += dy; x[3] += dy; });
+    const inside = r => { const c = horiz ? (r[0]+r[2])/2 : (r[1]+r[3])/2; return c >= min-1 && c <= max+1; };
+    d.DOORS.forEach(o => { if (sameBand(o.rect, w, horiz) && inside(o.rect)){ o.rect[0] += dx; o.rect[2] += dx; o.rect[1] += dy; o.rect[3] += dy; o.h[0] += dx; o.h[1] += dy; } });
+    d.WINS.forEach(r => { if (sameBand(r, w, horiz) && inside(r)){ r[0] += dx; r[2] += dx; r[1] += dy; r[3] += dy; } });
+    d.SLIDES.forEach(o => { if (sameBand(o.rect, w, horiz) && inside(o.rect)){ o.rect[0] += dx; o.rect[2] += dx; o.rect[1] += dy; o.rect[3] += dy; } });
+    return {draft:d, guides:{x:sx?[sx.at]:[], y:sy?[sy.at]:[]}};
+  }
+  function moveOpening(orig, hit, rawDx, rawDy){
+    const obj = hit.kind === 'door' ? orig.DOORS[hit.i] : hit.kind === 'win' ? orig.WINS[hit.i] : orig.SLIDES[hit.i];
+    if (!obj) return null;
+    const rect = hit.kind === 'win' ? [obj[0], obj[1], obj[2], obj[3]] : obj.rect;
+    const horiz = (rect[2]-rect[0]) >= (rect[3]-rect[1]);
+    const width = horiz ? rect[2]-rect[0] : rect[3]-rect[1];
+    const coll = orig.WALLS.filter(w => sameBand(w, rect, horiz));
+    if (!coll.length) return null;
+    const spans = coll.map(w => horiz ? [w[0], w[2]] : [w[1], w[3]]).flat();
+    let spanMin = Math.min(...spans), spanMax = Math.max(...spans);
+    spanMin = Math.min(spanMin, horiz ? rect[0] : rect[1]);
+    spanMax = Math.max(spanMax, horiz ? rect[2] : rect[3]);
+    const start = horiz ? rect[0] : rect[1], end = horiz ? rect[2] : rect[3];
+    const intervals = [];
+    const add = r => { if (sameBand(r, rect, horiz)) intervals.push(horiz ? [r[0],r[2]] : [r[1],r[3]]); };
+    orig.DOORS.forEach((o,j) => { if (!(hit.kind === 'door' && j === hit.i)) add(o.rect); });
+    orig.WINS.forEach((r,j) => { if (!(hit.kind === 'win' && j === hit.i)) add(r); });
+    orig.SLIDES.forEach((o,j) => { if (!(hit.kind === 'slide' && j === hit.i)) add(o.rect); });
+    let left = spanMin, right = spanMax;
+    intervals.forEach(([a,b]) => { if (b <= start+1) left = Math.max(left, b); if (a >= end-1) right = Math.min(right, a); });
+    const minStart = Math.max(spanMin, left), maxStart = Math.min(spanMax-width, right-width);
+    if (maxStart < minStart) return null;
+    const feats = [spanMin, spanMax, (spanMin+spanMax)/2];
+    coll.forEach(w => { feats.push(horiz ? w[0] : w[1], horiz ? w[2] : w[3]); });
+    intervals.forEach(([a,b]) => feats.push(a, b, (a+b)/2));
+    const snap = bestDelta([start, end, (start+end)/2], feats, 80);
+    const delta = snap ? snap.d : Math.round((start + (horiz ? rawDx : rawDy))/10)*10 - start;
+    const newStart = clamp(start + delta, minStart, maxStart), newEnd = newStart + width;
+    const d = clone(orig);
+    const before = d.WALLS.find(w => sameBand(w, rect, horiz) && Math.abs((horiz ? w[2] : w[3]) - start) < 2);
+    const after = d.WALLS.find(w => sameBand(w, rect, horiz) && Math.abs((horiz ? w[0] : w[1]) - end) < 2);
+    const type = before?.[4] || after?.[4] || coll[0][4] || 'n';
+    if (before) before[horiz?2:3] = newStart;
+    if (after) after[horiz?0:1] = newEnd;
+    if (!before && newStart > spanMin+1) d.WALLS.push(horiz ? [spanMin, rect[1], newStart, rect[3], type] : [rect[0], spanMin, rect[2], newStart, type]);
+    if (!after && newEnd < spanMax-1) d.WALLS.push(horiz ? [newEnd, rect[1], spanMax, rect[3], type] : [rect[0], newEnd, rect[2], spanMax, type]);
+    const shift = newStart - start;
+    const o = hit.kind === 'door' ? d.DOORS[hit.i] : hit.kind === 'win' ? d.WINS[hit.i] : d.SLIDES[hit.i];
+    if (hit.kind === 'door'){
+      o.rect[0] += shift; o.rect[2] += shift; o.rect[1] += (horiz ? 0 : shift); o.rect[3] += (horiz ? 0 : shift);
+      o.h[horiz?0:1] += shift;
+    } else if (hit.kind === 'win'){
+      o[0] += shift; o[2] += shift; o[1] += (horiz ? 0 : shift); o[3] += (horiz ? 0 : shift);
+    } else {
+      o.rect[0] += shift; o.rect[2] += shift; o.rect[1] += (horiz ? 0 : shift); o.rect[3] += (horiz ? 0 : shift);
+    }
+    d.WALLS = d.WALLS.filter(w => w[2]-w[0] > 1 && w[3]-w[1] > 1);
+    const guide = snap && Math.abs(newStart - (start + snap.d)) < 1 ? snap.at : null;
+    return {draft:d, guides:{x:horiz && guide !== null ? [guide] : [], y:!horiz && guide !== null ? [guide] : []}};
+  }
+
   function addOpening(kind, x, y){
     const hit = wallAt(x, y);
     if (!hit) return toast(tr('请点在墙上','Click on a wall'));
@@ -1883,7 +1976,7 @@ const planEditor = (() => {
   }
 
   const hints = {
-    select:'点选对象；点空白拖动平移；滚轮缩放',
+    select:'点选；拖动墙体 / 门窗可移动并自动对齐；点空白平移；滚轮缩放',
     wall:'按住拖动画墙，自动水平 / 垂直，端点吸附墙角',
     room:'拖出矩形房间；勾选自动生成墙会沿房间加墙',
     door:'点已有墙体放置门，自动开洞',
@@ -1966,6 +2059,10 @@ const planEditor = (() => {
       else r = [round(Math.min(drag.a.x,drag.b.x)), round(Math.min(drag.a.y,drag.b.y)), round(Math.max(drag.a.x,drag.b.x)), round(Math.max(drag.a.y,drag.b.y))];
       s += `<rect x="${r[0]}" y="${r[1]}" width="${Math.max(0,r[2]-r[0])}" height="${Math.max(0,r[3]-r[1])}" fill="#b5653a" fill-opacity=".2" stroke="#b5653a" stroke-width="2" stroke-dasharray="6 4" vector-effect="non-scaling-stroke"/>`;
     }
+    if (move?.guides){
+      (move.guides.x || []).forEach(gx => s += `<line x1="${gx}" y1="${v.y}" x2="${gx}" y2="${v.y+v.h}" stroke="#2f5d62" stroke-width="1.5" stroke-dasharray="7 5" vector-effect="non-scaling-stroke"/>`);
+      (move.guides.y || []).forEach(gy => s += `<line x1="${v.x}" y1="${gy}" x2="${v.x+v.w}" y2="${gy}" stroke="#2f5d62" stroke-width="1.5" stroke-dasharray="7 5" vector-effect="non-scaling-stroke"/>`);
+    }
     if (!draft.WALLS.length && !draft.ROOMS.length){
       s += `<text x="${v.x+v.w/2}" y="${v.y+v.h/2}" font-size="${clamp(v.w/14,140,320)}" text-anchor="middle" fill="#a79b88">拖动画墙 / 房间</text>`;
     }
@@ -2042,7 +2139,12 @@ const planEditor = (() => {
     if (tool === 'select'){
       const hit = hitAt(p.x, p.y);
       sel = hit; render(); renderProps();
-      if (!hit){ pan = {last:p}; svg.setPointerCapture(e.pointerId); }
+      if (!hit){
+        pan = {last:p}; svg.setPointerCapture(e.pointerId);
+      } else if (['wall','door','win','slide'].includes(hit.kind)){
+        move = {hit, start:p, startClient:{x:e.clientX, y:e.clientY}, orig:clone(draft), moved:false, guides:{x:[], y:[]}};
+        svg.setPointerCapture(e.pointerId);
+      }
       return;
     }
     if (tool === 'delete'){ const hit = hitAt(p.x, p.y); if (hit){ sel = hit; deleteSel(); } return; }
@@ -2060,6 +2162,18 @@ const planEditor = (() => {
     if (!open) return;
     const p = toMM(e);
     q('#peCursor').textContent = `${Math.round(p.x)}, ${Math.round(p.y)} mm`;
+    if (move){
+      if (!move.moved && Math.hypot(e.clientX-move.startClient.x, e.clientY-move.startClient.y) < 4) return;
+      const rawDx = p.x - move.start.x, rawDy = p.y - move.start.y;
+      const lock = e.shiftKey ? (Math.abs(rawDx) >= Math.abs(rawDy) ? 'x' : 'y') : null;
+      const res = move.hit.kind === 'wall'
+        ? moveWall(move.orig, move.hit.i, rawDx, rawDy, lock)
+        : moveOpening(move.orig, move.hit, rawDx, rawDy);
+      if (!res) return;
+      if (!move.moved){ pushHistory(); move.moved = true; }
+      draft = res.draft; move.guides = res.guides; render();
+      return;
+    }
     if (pan){ viewBox.x -= p.x - pan.last.x; viewBox.y -= p.y - pan.last.y; pan.last = p; render(); return; }
     if (drag && (drag.kind === 'wall' || drag.kind === 'room')){ drag.b = snapPoint(p); render(); return; }
     if (tool === 'door' || tool === 'window' || tool === 'slide'){
@@ -2069,6 +2183,7 @@ const planEditor = (() => {
   }
   function onUp(e){
     if (!open) return;
+    if (move){ const moved = move.moved; move = null; if (moved){ render(); renderProps(); } return; }
     if (pan){ pan = null; return; }
     if (!drag) return;
     if (drag.kind === 'wall') addWall(drag.a, drag.b);
@@ -2204,7 +2319,7 @@ const planEditor = (() => {
   svg.addEventListener('pointerdown', onDown);
   svg.addEventListener('pointermove', onMove);
   svg.addEventListener('pointerup', onUp);
-  svg.addEventListener('pointercancel', () => { pan = null; drag = null; });
+  svg.addEventListener('pointercancel', () => { pan = null; drag = null; move = null; });
   svg.addEventListener('pointerleave', () => { if (hover){ hover = null; render(); } });
   svg.addEventListener('wheel', onWheel, {passive:false});
   svg.addEventListener('contextmenu', e => e.preventDefault());
